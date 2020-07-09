@@ -1,0 +1,827 @@
+---
+title: "Untitled"
+output: html_document
+---
+Load the packages needed for getting these codes to work. Cutadapt and MACSE will also be required and installation instructions for those software should be obtained from their respective websites.
+```{r}
+library(dada2)
+library(ShortRead)
+packageVersion("ShortRead")
+library(Biostrings)
+library(ggplot2)
+library(hiReadsProcessor)
+library(seqinr)
+library(phyloseq)
+library(dplyr)
+```
+
+#Processing
+Set the working directory for processing. Needs to be repeated for each set of files
+
+```{r}
+
+#setwd("~/Desktop/DEVOTES-ARMS/KAUST/")
+#setwd("~/Desktop/DEVOTES-ARMS/CNRS/")
+#setwd("~/Desktop/DEVOTES-ARMS/CONISMA/")
+#setwd("~/Desktop/DEVOTES-ARMS/AZTI_DEVOTES/")
+setwd("~/Desktop/DEVOTES-ARMS/AZTI_rep/")
+
+```
+
+
+Designate the path where the fastq files can be found. Make a list of these paths
+
+```{r}
+#path <- "~/Desktop/DEVOTES-ARMS/KAUST"  ## CHANGE ME to the directory containing the fastq files.
+#path <- "~/Desktop/DEVOTES-ARMS/CNRS"  ## CHANGE ME to the directory containing the fastq files.
+#path <- "~/Desktop/DEVOTES-ARMS/CONISMA"  ## CHANGE ME to the directory containing the fastq files.
+#path <- "~/Desktop/DEVOTES-ARMS/AZTI_DEVOTES"  ## CHANGE ME to the directory containing the fastq files.
+path <- "~/Desktop/DEVOTES-ARMS/AZTI_rep"  ## CHANGE ME to the directory containing the fastq files.
+
+list.files(path)
+```
+
+
+Make a list of the forward and reverse fastq files (check the sequence names to make sure you run the right lines for the files). CONISMA files are interleaved. Repeat and switch forward and reverse
+
+```{r}
+fnFs <- sort(list.files(path, pattern = "R1_001.fastq.gz", full.names = TRUE))
+fnRs <- sort(list.files(path, pattern = "R2_001.fastq.gz", full.names = TRUE))
+
+
+#fnFs <- sort(list.files(path, pattern = "R1.fastq.gz", full.names = TRUE))
+#fnRs <- sort(list.files(path, pattern = "R2.fastq.gz", full.names = TRUE))
+
+```
+
+
+Designate the forward and reverse primers
+
+```{r}
+FWD <- "GGWACWGGWTGAACWGTWTAYCCYCC"
+
+REV <- "TANACYTCNGGRTGNCCRAARAAYCA"
+
+```
+
+Make a vector of the possible orientations of both the forward and revere primers
+
+```{r}
+allOrients <- function(primer) {
+    # Create all orientations of the input sequence
+    require(Biostrings)
+    dna <- DNAString(primer)  # The Biostrings works w/ DNAString objects rather than character vectors
+    orients <- c(Forward = dna, Complement = complement(dna), Reverse = reverse(dna), 
+        RevComp = reverseComplement(dna))
+    return(sapply(orients, toString))  # Convert back to character vector
+}
+FWD.orients <- allOrients(FWD)
+REV.orients <- allOrients(REV)
+FWD.orients
+```
+
+Calculate the number of reads where the forward and reverse primers are found. In this case for the second sample in fnFs(and fnRs). Note this only finds exact matches.
+
+```{r}
+primerHits <- function(primer, fn) {
+    # Counts number of reads in which the primer is found
+    nhits <- vcountPattern(primer, sread(readFastq(fn)), fixed = FALSE)
+    return(sum(nhits > 0))
+}
+rbind(FWD.ForwardReads = sapply(FWD.orients, primerHits, fn = fnFs[[2]]), 
+    REV.ReverseReads = sapply(REV.orients, primerHits, fn = fnRs[[2]]))
+```
+
+Load up cutadapt for use in R
+
+```{r}
+cutadapt <- "/Users/johnpearman/Documents/miniconda2/bin/cutadapt" # CHANGE ME to the cutadapt path on your machine
+system2(cutadapt, args = "--version") # Run shell commands from R
+```
+
+Create a folder called cutadapt
+
+Run cutadapt for all files in fnFs/fnRs
+
+```{r}
+path.cut <- file.path(path, "cutadapt")
+if(!dir.exists(path.cut)) dir.create(path.cut)
+fnFs.cut <- file.path(path.cut, basename(fnFs))
+fnRs.cut <- file.path(path.cut, basename(fnRs))
+
+
+# Trim FWD off of R1 (forward reads) - 
+R1.flags <- paste0("-g", " ^", FWD) 
+# Trim REV off of R2 (reverse reads)
+R2.flags <- paste0("-G", " ^", REV) 
+# Run Cutadapt
+for(i in seq_along(fnFs)) {
+  system2(cutadapt, args = c("-e 0.05 --discard-untrimmed", R1.flags, R2.flags,
+                             "-o", fnFs.cut[i], "-p", fnRs.cut[i], # output files
+                             fnFs[i], fnRs[i])) # input files
+}
+```
+
+
+Look at how many primers are left on your reads. This should be 0 now. Although with the ^ designation there are occassionally a few primers still present due to internal primer hits. These seem to be removed later on in the process. 
+
+```{r}
+rbind(FWD.ForwardReads = sapply(FWD.orients, primerHits, fn = fnFs.cut[[1]]), 
+    REV.ReverseReads = sapply(REV.orients, primerHits, fn = fnRs.cut[[1]]))
+```
+
+
+Check that the forward and reverse reads are the same once cutadapt has been undertaken
+
+```{r}
+# Forward and reverse fastq filenames have the format:
+cutFs <- sort(list.files(path.cut, pattern = "R1_001.fastq.gz", full.names = TRUE))
+cutRs <- sort(list.files(path.cut, pattern = "R2_001.fastq.gz", full.names = TRUE))
+
+
+#cutFs <- sort(list.files(path.cut, pattern = "R1.fastq.gz", full.names = TRUE))
+#cutRs <- sort(list.files(path.cut, pattern = "R2.fastq.gz", full.names = TRUE))
+
+
+if(length(cutRs) == length(cutRs)) print("Forward and reverse files match. Go forth and explore")
+if (length(cutRs) != length(cutRs)) stop("Forward and reverse files do not match. Better go back and have a check")
+
+
+# Extract sample names, assuming filenames have format:
+get.sample.name <- function(fname) strsplit(basename(fname), "_")[[1]][1]
+sample.names <- unname(sapply(cutFs, get.sample.name))
+head(sample.names)
+```
+
+Plot the quality information of the forward and reverse reads. If less than 20 plots then plot all. If not then select a random 20 plots to check. 
+
+```{r}
+
+if(length(cutFs) <= 20) {
+  plotQualityProfile(cutFs) + 
+  scale_x_continuous(breaks=seq(0,250,10)) + 
+  scale_y_continuous(breaks=seq(0,40,2)) +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1))
+  plotQualityProfile(filtpathR) + 
+  scale_x_continuous(breaks=seq(0,250,10)) + 
+  scale_y_continuous(breaks=seq(0,40,2)) +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1))
+} else {
+  rand_samples <- sample(size = 20, 1:length(cutFs)) # grab 20 random samples to plot
+  fwd_qual_plots <- plotQualityProfile(cutFs[rand_samples]) + 
+  scale_x_continuous(breaks=seq(0,250,10)) + 
+  scale_y_continuous(breaks=seq(0,40,2)) +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1))
+  rev_qual_plots <- plotQualityProfile(cutRs[rand_samples]) + 
+  scale_x_continuous(breaks=seq(0,250,10)) + 
+  scale_y_continuous(breaks=seq(0,40,2)) +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1))
+}
+
+fwd_qual_plots
+rev_qual_plots
+```
+
+Print out the forward quality plot
+
+```{r}
+jpeg(file="Quality.Plot.COI.F.jpg",res=300, width=15, height=8, units="in")
+fwd_qual_plots
+dev.off()
+```
+
+Print out the reverse quality plot
+
+```{r}
+jpeg(file="Quality.Plot.COI.R.jpg",res=300, width=15, height=8, units="in")
+rev_qual_plots
+dev.off()
+```
+
+Create path for filtered files
+
+```{r}
+filtpathF <- file.path(path.cut, "filtered", basename(cutFs))
+filtpathR <- file.path(path.cut, "filtered", basename(cutRs))
+```
+
+Trim files. Truncation length of 165 and 160 bp for forward and reverse respectively. maxEE of 4 and 6 for all except KAUST where 2 and 4 used.
+
+```{r}
+
+
+out <- filterAndTrim(cutFs, filtpathF, cutRs, filtpathR,
+ truncLen=c(165,160), maxEE=c(4,6), truncQ=2, maxN=0, rm.phix=TRUE,
+ compress=TRUE, verbose=TRUE, multithread=TRUE)
+
+out <- as.data.frame(out)
+
+out$perc <- out$reads.out/out$reads.in*100
+
+out
+```
+
+Check that files names matched
+
+```{r}
+
+sample.names <- sapply(strsplit(basename(filtpathF), "_"), `[`, 1) # Assumes filename = samplename_XXX.fastq.gz
+sample.namesR <- sapply(strsplit(basename(filtpathR), "_"), `[`, 1) # Assumes filename = samplename_XXX.fastq.gz
+if(identical(sample.names, sample.namesR)) {print("Files are still matching.....congratulations")
+  } else {stop("Forward and reverse files do not match.")}
+names(filtpathF) <- sample.names
+names(filtpathR) <- sample.namesR
+
+```
+
+Create error matrix for forward and reverse reads using 1e8 bases.
+
+```{r}
+set.seed(100) # set seed to ensure that randomized steps are replicatable
+
+# Learn forward error rates
+errF <- learnErrors(filtpathF, nbases=1e8, multithread=TRUE, verbose = TRUE)
+
+# Learn reverse error rates
+errR <- learnErrors(filtpathR, nbases=1e8, multithread=TRUE, verbose = TRUE)
+```
+
+Forward error plot 
+
+```{r}
+
+errF_plot <- plotErrors(errF, nominalQ=TRUE)
+
+errF_plot
+
+```
+
+Reverse error plot
+
+```{r}
+
+errR_plot <- plotErrors(errR, nominalQ=TRUE)
+errR_plot
+
+```
+
+Dereplicate sequences
+
+```{r}
+
+derepF <- derepFastq(filtpathF, verbose=TRUE)
+derepR <- derepFastq(filtpathR, verbose=TRUE)
+
+```
+
+ASV inferrence using pseudopooling
+
+```{r}
+
+dadaF.pseudo <- dada(derepF, err=errF, multithread=TRUE, pool="pseudo")
+dadaR.pseudo <- dada(derepR, err=errR, multithread=TRUE, pool="pseudo")
+
+```
+
+Merge forward and reverse reads with 0 mismatch and a min overlap of 10. 
+
+Create ASV table
+
+```{r}
+
+mergers <- mergePairs(dadaF.pseudo, derepF, dadaR.pseudo, derepR, maxMismatch = 0, minOverlap = 10, verbose=TRUE)
+seqtab <- makeSequenceTable(mergers)
+
+```
+
+Save ASV table
+
+```{r}
+
+split.dir.name <- sapply(strsplit(basename(path), "-"), `[`)
+
+path <- "~/Desktop/DEVOTES-ARMS/"  ## CHANGE ME to the directory containing the fastq files.
+
+saveRDS(seqtab, paste0(path, "DEVOTES_seqtab.16S.", split.dir.name,".rds"))
+
+```
+
+Get statistics for number of reads at each step.
+
+```{r}
+getN <- function(x) sum(getUniques(x))
+track <- cbind(out, sapply(dadaF.pseudo, getN), sapply(dadaR.pseudo, getN), sapply(mergers, getN))
+colnames(track) <- c("input", "filtered", "perc.filtered", "denoisedF", "denoisedR", "merged")
+rownames(track) <- sample.names
+
+track <- as.data.frame(track)
+
+track$perc.denoisedF <- track$denoisedF/track$input*100
+track$perc.denoisedR <- track$denoisedR/track$input*100
+track$perc.merged <- track$merged/track$input*100
+
+write.csv(track, paste0(path, "DEVOTES_track.16S.", split.dir.name,".csv"))
+```
+
+Make sure file names follow same naming scheme
+
+```{r}
+AZTI <- readRDS("~/Desktop/DEVOTES-ARMS/DEVOTES_seqtab.16S.AZTI_DEVOTES.rds")
+AZTI_rep <- readRDS("~/Desktop/DEVOTES-ARMS/DEVOTES_seqtab.16S.AZTI_rep.rds")
+CNRS <- readRDS("~/Desktop/DEVOTES-ARMS/DEVOTES_seqtab.16S.CNRS.rds")
+CONISMA <- readRDS("~/Desktop/DEVOTES-ARMS/DEVOTES_seqtab.16S.CONISMA.rds")
+CONISMA_rep <- readRDS("~/Desktop/DEVOTES-ARMS/DEVOTES_seqtab.16S.CONISMArep.rds")
+KAUST <- readRDS("~/Desktop/DEVOTES-ARMS/DEVOTES_seqtab.16S.KAUST.rds")
+
+
+rownames(AZTI) <- c("ALA.A1.100", "ALA.A1.500", "ALA.A1.Sessile", "ALA.A2.100",    
+"ALA.A2.500", "ALA.A2.Sessile", "ALA.A3.100", "ALA.A3.500",    
+"ALA.A3.Sessile", "CHE.A1.100", "CHE.A1.500", "CHE.A1.Sessile",
+"CHE.A2.100", "CHE.A2.500", "CHE.A2.Sessile", "CHE.A3.100",    
+"CHE.A3.500", "CHE.A3.Sessile", "KAM.A1.100", "KAM.A1.500",    
+"KAM.A1.Sessile", "KAM.A2.100", "KAM.A2.500", "KAM.A2.Sessile",
+"KAM.A3.100", "KAM.A3.500", "KAM.A3.Sessile", "KAR.A1.100",    
+"KAR.A1.2000uM",  "KAR.A1.500", "KAR.A1.Sessile", "KAR.A2.100",    
+"KAR.A2.500", "KAR.A2.Sessile", "LEK.A1.100", "LEK.A1.500",    
+"LEK.A1.Sessile", "LEK.A2.100", "LEK.A2.500", "LEK.A2.Sessile",
+"LEK.A3.100", "LEK.A3.500", "LEK.A3.Sessile", "PAL.A1.100",    
+"PAL.A1.500", "PAL.A1.Sessile", "PAL.A2.100", "PAL.A2.500",    
+"PAL.A2.Sessile", "PAL.A3.100", "PAL.A3.500", "PAL.A3.Sessile",
+"PAS.A1.100", "PAS.A1.500", "PAS.A1.Sessile", "PAS.A2.100",    
+"PAS.A2.500", "PAS.A2.Sessile", "PAS.A3.100", "PAS.A3.500",    
+"PAS.A3.Sessile", "ZUM.A1.100", "ZUM.A1.500", "ZUM.A1.Sessile",
+"ZUM.A2.100", "ZUM.A2.500", "ZUM.A2.Sessile", "ZUM.A3.100",    
+"ZUM.A3.500", "ZUM.A3.Sessile")
+
+
+
+rownames(AZTI_rep) <- c("ALA.A1.100.rep", "ALA.A1.500.rep", "ALA.A1.Sessile.rep", "ALA.A2.100.rep",    
+"ALA.A2.500.rep", "ALA.A2.Sessile.rep", "ALA.A3.100.rep", "ALA.A3.500.rep",    
+"ALA.A3.Sessile.rep", "CHE.A1.100.rep", "CHE.A1.500.rep", "CHE.A1.Sessile.rep",
+"CHE.A2.100.rep", "CHE.A2.500.rep", "CHE.A2.Sessile.rep", "CHE.A3.100.rep",    
+"CHE.A3.500.rep", "CHE.A3.Sessile.rep", "KAM.A1.100.rep", "KAM.A1.500.rep",    
+ "KAM.A1.Sessile.rep", "KAM.A2.100.rep", "KAM.A2.500.rep", "KAM.A2.Sessile.rep",
+"KAM.A3.100.rep", "KAM.A3.500.rep", "KAM.A3.Sessile.rep", "KAR.A1.100.rep",    
+"KAR.A1.500.rep", "KAR.A1.Sessile.rep", "KAR.A2.100.rep", "KAR.A2.500.rep",    
+"KAR.A2.Sessile.rep", "LEK.A1.100.rep", "LEK.A1.500.rep", "LEK.A1.Sessile.rep",
+"LEK.A2.100.rep", "LEK.A2.500.rep", "LEK.A2.Sessile.rep", "LEK.A3.100.rep",    
+"LEK.A3.500.rep", "LEK.A3.Sessile.rep", "PAL.A1.100.rep", "PAL.A1.500.rep",    
+"PAL.A1.Sessile.rep", "PAL.A2.100.rep", "PAL.A2.500.rep", "PAL.A2.Sessile.rep",
+"PAL.A3.100.rep", "PAL.A3.500.rep", "PAL.A3.Sessile.rep", "PAS.A1.100.rep",    
+"PAS.A1.500.rep", "PAS.A1.Sessile.rep", "PAS.A2.100.rep", "PAS.A2.500.rep",    
+"PAS.A2.Sessile.rep", "PAS.A3.100.rep", "PAS.A3.500.rep", "PAS.A3.Sessile.rep",
+"ZUM.A1.100.rep", "ZUM.A1.500.rep", "ZUM.A1.Sessile.rep", "ZUM.A2.100.rep",    
+"ZUM.A2.500.rep", "ZUM.A2.Sessile.rep", "ZUM.A3.100.rep", "ZUM.A3.500.rep", "ZUM.A3.Sessile.rep") 
+
+
+rownames(CNRS) <- c("CAS.A1.100", "CAS.A1.500", "CAS.A1.Sessile", "CAS.A2.100",    
+"CAS.A2.500", "CAS.A2.Sessile", "CAS.A3.100", "CAS.A3.500",    
+"CAS.A3.Sessile", "ELV.A1.100", "ELV.A1.500", "ELV.A1.Sessile",
+"ELV.A2.100", "ELV.A2.500", "ELV.A2.Sessile", "ELV.A3.100",    
+"ELV.A3.500", "ELV.A3.Sessile", "RIS.A1.100", "RIS.A1.500",    
+"RIS.A1.Sessile", "RIS.A2.100", "RIS.A2.500", "RIS.A2.Sessile",
+"RIS.A3.100", "RIS.A3.500", "RIS.A3.Sessile")
+
+
+rownames(CONISMA) <- c("DS.A1.100", "DS.A1.500", "DS.A1.Sessile", "DS.A2.100",    
+"DS.A2.500", "DS.A2.Sessile", "DS.A3.Sessile", "GA.A1.100",    
+"GA.A1.500", "GA.A1.Sessile", "GA.A2.100", "GA.A2.500",    
+"GA.A2.Sessile", "LS.A1.100", "LS.A1.500", "LS.A1.Sessile",
+"LS.A2.100", "LS.A2.500", "LS.A2.Sessile", "LS.A3.100",    
+"LS.A3.500", "LS.A3.Sessile")
+
+
+
+rownames(CONISMA_rep) <- c("DS.A1.100.rep", "DS.A1.500.rep", "DS.A1.Sessile.rep", "DS.A2.100.rep",    
+"DS.A2.500.rep", "DS.A2.Sessile.rep", "DS.A3.Sessile.rep", "GA.A1.100.rep",    
+"GA.A1.500.rep", "GA.A1.Sessile.rep", "GA.A2.100.rep", "GA.A2.500.rep",    
+"GA.A2.Sessile.rep", "LS.A1.100.rep", "LS.A1.500.rep", "LS.A1.Sessile.rep",
+"LS.A2.100.rep", "LS.A2.500.rep", "LS.A2.Sessile.rep", "LS.A3.100.rep",    
+"LS.A3.500.rep", "LS.A3.Sessile.rep")
+
+
+
+rownames(KAUST) <- c("JS1.A1.100", "JS1.A1.500", "JS1.A1.Sessile", "JS1.A2.100", "JS1.A2.500", "JS1.A2.Sessile", "JS1.A3.100", "JS1.A3.500", "JS1.A3.Sessile",  "JS2.A1.100", "JS2.A1.500", "JS2.A1.Sessile", "JS2.A2.100", "JS2.A2.500", "JS2.A2.Sessile", "JS2.A3.100", "JS2.A3.500", "JS2.A3.Sessile", "JS3.A1.100", "JS3.A1.500", "JS3.A1.Sessile",   "JS3.A2.100",  "JS3.A2.500", "JS3.A2.Sessile", "JS3.A3.100", "JS3.A3.500", "JS3.A3.Sessile")
+
+```
+
+Histogram plots showing distribution of sequence lengths
+
+```{r}
+hist(nchar(getSequences(AZTI)), main="Distribution of sequence lengths")
+hist(nchar(getSequences(AZTI_rep)), main="Distribution of sequence lengths")
+hist(nchar(getSequences(CNRS)), main="Distribution of sequence lengths")
+hist(nchar(getSequences(CONISMA)), main="Distribution of sequence lengths")
+hist(nchar(getSequences(CONISMA_rep)), main="Distribution of sequence lengths")
+hist(nchar(getSequences(KAUST)), main="Distribution of sequence lengths")
+
+```
+
+Combine all the separate ASV tables together and save
+
+```{r}
+DEVOTES.merged <- mergeSequenceTables(KAUST, CNRS, CONISMA, CONISMA_rep, AZTI, AZTI_rep)
+
+saveRDS(DEVOTES.merged, "~/Desktop/DEVOTES-ARMS/DEVOTES.merged.rds")
+
+```
+
+
+Trim the sequences to between 312 and 314 bp and remove chimeras.
+
+```{r}
+table(nchar(getSequences(DEVOTES.merged)))
+
+hist(nchar(getSequences(DEVOTES.merged)), main="Distribution of sequence lengths")
+
+DEVOTES.merged.2 <- DEVOTES.merged[,nchar(colnames(DEVOTES.merged)) %in% seq(312,314)]
+
+DEVOTES.merged.nochim <- removeBimeraDenovo(DEVOTES.merged.2, multithread=TRUE, verbose=TRUE)
+
+saveRDS(DEVOTES.merged.nochim, "~/Desktop/DEVOTES-ARMS/DEVOTES.merged.nochim.rds")
+
+```
+
+Assign sequences against a combined BOLD and NCBI database.
+
+```{r}
+
+BOLDDB <- "~/Documents/Reference_db/BOLD.NCBI/BOLD.NCBI.sep19.trimmed.fasta"
+
+
+output <-  paste0("~/Desktop/DEVOTES-ARMS/")
+
+# Load Datafile
+sq <- getSequences(readRDS(paste0(output,"DEVOTES.merged.nochim.rds")))
+
+# Setup Output prefix for slice files (rds)
+file_name_prefix <- paste0(output, 'DEVOTES.merged.nochim.tax.slice_')
+
+# Set chunksize
+CHUNKSIZE = 1000
+
+# Calculate number of slices and remainder
+NUM_SQ = length(sq)
+NUM_SLICES <- as.integer(NUM_SQ/CHUNKSIZE)
+LEN_REMAINDER <- as.integer(NUM_SQ%%CHUNKSIZE)
+
+# Compute full slices
+idx <- 0
+while (idx < NUM_SLICES)
+{
+  start_idx = (idx*CHUNKSIZE)+1
+  end_idx =   (idx+1)*CHUNKSIZE
+  fname = paste0(file_name_prefix, start_idx, '_', end_idx, '.rds')
+
+  result_slice <- assignTaxonomy(sq[start_idx:end_idx], BOLDDB, minBoot= 50, multithread=TRUE)
+  saveRDS(result_slice, fname)
+  idx <- idx+1
+}
+# Compute remainder if present
+if (LEN_REMAINDER!=0){
+  start_idx = (NUM_SLICES*CHUNKSIZE)+1
+  end_idx =   NUM_SQ
+  fname = paste0(file_name_prefix, start_idx, '_', end_idx, '.rds')
+
+  result_slice <- assignTaxonomy(sq[start_idx:end_idx], BOLDDB, minBoot= 50,  multithread=TRUE)
+  saveRDS(result_slice, fname)
+}
+
+
+```
+
+Combine taxonomy table together
+
+```{r}
+t1 <- readRDS("~/Desktop/DEVOTES-ARMS/DEVOTES.merged.nochim.tax.slice_1_1000.rds")
+t2 <- readRDS("~/Desktop/DEVOTES-ARMS/DEVOTES.merged.nochim.tax.slice_1001_2000.rds")
+t3 <- readRDS("~/Desktop/DEVOTES-ARMS/DEVOTES.merged.nochim.tax.slice_2001_3000.rds")
+t4 <- readRDS("~/Desktop/DEVOTES-ARMS/DEVOTES.merged.nochim.tax.slice_3001_4000.rds")
+t5 <- readRDS("~/Desktop/DEVOTES-ARMS/DEVOTES.merged.nochim.tax.slice_4001_5000.rds")
+t6 <- readRDS("~/Desktop/DEVOTES-ARMS/DEVOTES.merged.nochim.tax.slice_5001_6000.rds")
+t7 <- readRDS("~/Desktop/DEVOTES-ARMS/DEVOTES.merged.nochim.tax.slice_6001_7000.rds")
+t8 <- readRDS("~/Desktop/DEVOTES-ARMS/DEVOTES.merged.nochim.tax.slice_7001_8000.rds")
+t9 <- readRDS("~/Desktop/DEVOTES-ARMS/DEVOTES.merged.nochim.tax.slice_8001_9000.rds")
+t10 <- readRDS("~/Desktop/DEVOTES-ARMS/DEVOTES.merged.nochim.tax.slice_9001_10000.rds")
+
+t11 <- readRDS("~/Desktop/DEVOTES-ARMS/DEVOTES.merged.nochim.tax.slice_10001_11000.rds")
+t12 <- readRDS("~/Desktop/DEVOTES-ARMS/DEVOTES.merged.nochim.tax.slice_11001_12000.rds")
+t13 <- readRDS("~/Desktop/DEVOTES-ARMS/DEVOTES.merged.nochim.tax.slice_12001_13000.rds")
+t14 <- readRDS("~/Desktop/DEVOTES-ARMS/DEVOTES.merged.nochim.tax.slice_13001_14000.rds")
+t15 <- readRDS("~/Desktop/DEVOTES-ARMS/DEVOTES.merged.nochim.tax.slice_14001_15000.rds")
+t16 <- readRDS("~/Desktop/DEVOTES-ARMS/DEVOTES.merged.nochim.tax.slice_15001_16000.rds")
+t17 <- readRDS("~/Desktop/DEVOTES-ARMS/DEVOTES.merged.nochim.tax.slice_16001_17000.rds")
+t18 <- readRDS("~/Desktop/DEVOTES-ARMS/DEVOTES.merged.nochim.tax.slice_17001_18000.rds")
+t19 <- readRDS("~/Desktop/DEVOTES-ARMS/DEVOTES.merged.nochim.tax.slice_18001_19000.rds")
+t20 <- readRDS("~/Desktop/DEVOTES-ARMS/DEVOTES.merged.nochim.tax.slice_19001_20000.rds")
+
+t21 <- readRDS("~/Desktop/DEVOTES-ARMS/DEVOTES.merged.nochim.tax.slice_20001_21000.rds")
+t22 <- readRDS("~/Desktop/DEVOTES-ARMS/DEVOTES.merged.nochim.tax.slice_21001_22000.rds")
+t23 <- readRDS("~/Desktop/DEVOTES-ARMS/DEVOTES.merged.nochim.tax.slice_22001_23000.rds")
+t24 <- readRDS("~/Desktop/DEVOTES-ARMS/DEVOTES.merged.nochim.tax.slice_23001_24000.rds")
+t25 <- readRDS("~/Desktop/DEVOTES-ARMS/DEVOTES.merged.nochim.tax.slice_24001_25000.rds")
+t26 <- readRDS("~/Desktop/DEVOTES-ARMS/DEVOTES.merged.nochim.tax.slice_25001_26000.rds")
+t27 <- readRDS("~/Desktop/DEVOTES-ARMS/DEVOTES.merged.nochim.tax.slice_26001_27000.rds")
+t28 <- readRDS("~/Desktop/DEVOTES-ARMS/DEVOTES.merged.nochim.tax.slice_27001_28000.rds")
+t29 <- readRDS("~/Desktop/DEVOTES-ARMS/DEVOTES.merged.nochim.tax.slice_28001_29000.rds")
+t30 <- readRDS("~/Desktop/DEVOTES-ARMS/DEVOTES.merged.nochim.tax.slice_29001_30000.rds")
+
+t31 <- readRDS("~/Desktop/DEVOTES-ARMS/DEVOTES.merged.nochim.tax.slice_30001_31000.rds")
+t32 <- readRDS("~/Desktop/DEVOTES-ARMS/DEVOTES.merged.nochim.tax.slice_31001_32000.rds")
+t33 <- readRDS("~/Desktop/DEVOTES-ARMS/DEVOTES.merged.nochim.tax.slice_32001_33000.rds")
+t34 <- readRDS("~/Desktop/DEVOTES-ARMS/DEVOTES.merged.nochim.tax.slice_33001_34000.rds")
+t35 <- readRDS("~/Desktop/DEVOTES-ARMS/DEVOTES.merged.nochim.tax.slice_34001_35000.rds")
+t36 <- readRDS("~/Desktop/DEVOTES-ARMS/DEVOTES.merged.nochim.tax.slice_35001_36000.rds")
+t37 <- readRDS("~/Desktop/DEVOTES-ARMS/DEVOTES.merged.nochim.tax.slice_36001_37000.rds")
+t38 <- readRDS("~/Desktop/DEVOTES-ARMS/DEVOTES.merged.nochim.tax.slice_37001_38000.rds")
+t39 <- readRDS("~/Desktop/DEVOTES-ARMS/DEVOTES.merged.nochim.tax.slice_38001_39000.rds")
+t40 <- readRDS("~/Desktop/DEVOTES-ARMS/DEVOTES.merged.nochim.tax.slice_39001_40000.rds")
+
+t41 <- readRDS("~/Desktop/DEVOTES-ARMS/DEVOTES.merged.nochim.tax.slice_40001_40524.rds")
+
+taxa <- rbind(t1, t2, t3, t4, t5, t6, t7 ,t8, t9, t10, 
+              t11, t12, t13, t14, t15, t16, t17 ,t18, t19, t20,
+              t21, t22, t23, t24, t25, t26, t27 ,t28, t29, t30,
+              t31, t32, t33, t34, t35, t36, t37 ,t38, t39, t40, t41)
+
+saveRDS(taxa, "DEVOTES.merged.nochim.tax.rds")
+
+```
+
+
+Change the ASVs names to something more ammenable to being read. Output ASV table, taxonomy and fasta files with the new names
+
+```{r}
+
+DEVOTES.merged.nochim <- readRDS("~/Desktop/DEVOTES-ARMS/DEVOTES.merged.nochim.rds")
+DEVOTES.merged.nochim.tax50 <- readRDS("~/Desktop/DEVOTES-ARMS/DEVOTES.merged.nochim.tax.rds")
+
+
+asv_seqs <- colnames(DEVOTES.merged.nochim)
+asv_headers <- vector(dim(DEVOTES.merged.nochim)[2], mode="character")
+
+for (i in 1:dim(DEVOTES.merged.nochim)[2]) {
+  asv_headers[i] <- paste(">ASV", i, sep="_")
+}
+
+  # making and writing out a fasta of our final ASV seqs:
+asv_fasta <- c(rbind(asv_headers, asv_seqs))
+write(asv_fasta, "DEVOTES.merged.nochim_ASVs.fa")
+
+  # count table:
+asv_tab <- t(DEVOTES.merged.nochim)
+row.names(asv_tab) <- sub(">", "", asv_headers)
+write.table(asv_tab, "DEVOTES.merged.nochim_ASVs_counts.tsv", sep="\t", quote=F, col.names=NA)
+
+  # tax table:
+asv_tax <- DEVOTES.merged.nochim.tax50
+row.names(asv_tax) <- sub(">", "", asv_headers)
+write.table(asv_tax, "DEVOTES.merged.nochim_ASVs_taxonomy.tsv", sep="\t", quote=F, col.names=NA)
+
+
+```
+
+Read the fasta file back into R
+
+```{r}
+path <- "~/Desktop/DEVOTES-ARMS/" 
+
+path.cut <- file.path(path, "splitseqs")
+if(!dir.exists(path.cut)) dir.create(path.cut)
+
+
+x <- readDNAStringSet("DEVOTES.merged.nochim_ASVs.fa")
+
+```
+
+Split the fasta file into equal fractions. Roughly 1000 sequences per file
+
+```{r}
+
+  #Split the fasta file into 17 equal fractions (plus a couple left over)
+splitSeqsToFiles(x, 45, "fasta","splitseqs", "~/Desktop/DEVOTES-ARMS/splitseqs/")
+
+```
+
+Make list of the file names of these split sequences
+
+```{r}
+path <- "~/Desktop/DEVOTES-ARMS/splitseqs/"
+
+split.files <- sort(list.files(path, pattern = ".fasta", full.names = TRUE))
+
+```
+
+Create some output file names to use for MACSE
+
+```{r}
+
+
+get.sample.name <- function(fname) strsplit(basename(fname), ".fasta")[[1]][1]
+sample.names <- unname(sapply(split.files, get.sample.name))
+sample.names
+
+outputAA <- file.path(paste0(path, sample.names, "_AA.fa"))
+outputNT <- file.path(paste0(path, sample.names, "_NT.fa"))
+outputstats <- file.path(paste0(path, sample.names, "_stats.csv"))
+
+```
+
+Run MACSE using the invertebrate mitochondrial coding. Using an aligned invertebrate file from MIDORI. 
+
+```{r}
+javapath <- "/usr/bin/java"
+
+for(i in seq_along(split.files)) {
+  system2(javapath, args = c(" -jar ~/Desktop/macse_v2.03.jar -prog enrichAlignment -align ~/Documents/Reference_db/Midori/Midori_invert_macseNT.fa -seq ", split.files[i], "-gc_def 5 -maxSTOP_inSeq 0 -output_only_added_seq_ON =TRUE -fixed_alignment_ON =TRUE -maxDEL_inSeq 5 -maxFS_inSeq 0 -maxINS_inSeq 0  -out_AA ", outputAA[i], " -out_NT ", outputNT[i], " -out_tested_seq_info ", outputstats[i]))
+}
+
+```
+
+Make a table for psuedo and nonpseudo sequences
+
+```{r}
+path <- "~/Desktop/DEVOTES-ARMS/splitseqs/"
+
+split.files.res <- sort(list.files(path, pattern = "_stats.csv", full.names = TRUE))
+
+
+nonpseudo = data.frame()
+for(i in seq_along(split.files.res)){
+
+  splitseqres<-read.table(split.files.res[i], h=T, sep=";")
+  splitseqres1 <- splitseqres %>%
+    filter(added == "yes")
+  df <- data.frame(splitseqres1)
+  nonpseudo <- rbind(nonpseudo,df)
+  }
+
+pseudo = data.frame()
+for(i in seq_along(split.files.res)){
+
+  splitseqres<-read.table(split.files.res[i], h=T, sep=";")
+  splitseqres1 <- splitseqres %>%
+    filter(added == "no")
+  df <- data.frame(splitseqres1)
+  pseudo <- rbind(pseudo,df)
+  }
+
+```
+
+Subset those that were pseudogenes into a new fasta file
+
+```{r}
+fastafile <- read.fasta("DEVOTES.merged.nochim_ASVs.fa", seqtype="DNA", as.string=TRUE)
+
+fastafile1 <- fastafile[c(which(names(fastafile) %in% pseudo$name))]
+
+write.fasta(fastafile1, names=names(fastafile1), file.out = "~/Desktop/DEVOTES-ARMS/invert-pseudo/invertpseudo.fasta")
+```
+
+Read the fasta file back into R
+
+```{r}
+
+path <- "~/Desktop/DEVOTES-ARMS/" 
+
+path.cut <- file.path(path, "invert-pseudo")
+if(!dir.exists(path.cut)) dir.create(path.cut)
+
+
+x <- readDNAStringSet("~/Desktop/DEVOTES-ARMS/invert-pseudo/invertpseudo.fasta")
+
+```
+
+Split the fasta file into equal fractions. Roughly 1000 sequences per file
+
+```{r}
+  #Split the fasta file into 2 equal fractions (plus a couple left over)
+splitSeqsToFiles(x, 2, "split.fasta","splitseqs", "~/Desktop/DEVOTES-ARMS/invert-pseudo/")
+
+```
+
+Make list of the file names of these split sequences
+
+```{r}
+path <- "~/Desktop/DEVOTES-ARMS/invert-pseudo/"
+
+split.files <- sort(list.files(path, pattern = "split.fasta", full.names = TRUE))
+
+```
+
+Create some output file names to use for MACSE
+
+```{r}
+
+
+get.sample.name <- function(fname) strsplit(basename(fname), ".split.fasta")[[1]][1]
+sample.names <- unname(sapply(split.files, get.sample.name))
+sample.names
+
+outputAA <- file.path(paste0(path, sample.names, "_euk_AA.fa"))
+outputNT <- file.path(paste0(path, sample.names, "_euk_NT.fa"))
+outputstats <- file.path(paste0(path, sample.names, "_euk_stats.csv"))
+
+```
+
+Run MACSE using the vertebrate mitochondrial coding.
+
+```{r}
+javapath <- "/usr/bin/java"
+
+for(i in seq_along(split.files)) {
+  system2(javapath, args = c(" -jar ~/Desktop/macse_v2.03.jar -prog enrichAlignment -align ~/Documents/Reference_db/Midori/chordata_NT.fa -seq ", split.files[i], "-gc_def 2 -maxSTOP_inSeq 0 -output_only_added_seq_ON =TRUE -fixed_alignment_ON =TRUE -maxDEL_inSeq 5 -maxFS_inSeq 0 -maxINS_inSeq 0  -out_AA ", outputAA[i], " -out_NT ", outputNT[i], " -out_tested_seq_info ", outputstats[i]))
+}
+
+```
+
+Make a table for psuedo and nonpseudo sequences
+
+
+```{r}
+path <- "~/Desktop/DEVOTES-ARMS/invert-pseudo/"
+
+split.files.res <- sort(list.files(path, pattern = "euk_stats.csv", full.names = TRUE))
+
+
+nonpseudo.euk = data.frame()
+for(i in seq_along(split.files.res)){
+
+  splitseqres <- read.table(split.files.res[i], h=T, sep=";")
+  splitseqres1 <- splitseqres %>%
+    filter(added == "yes")
+  df <- data.frame(splitseqres1)
+  nonpseudo.euk <- rbind(nonpseudo.euk,df)
+  }
+
+pseudo.euk = data.frame()
+for(i in seq_along(split.files.res)){
+
+  splitseqres<-read.table(split.files.res[i], h=T, sep=";")
+  splitseqres1 <- splitseqres %>%
+    filter(added == "no")
+  df <- data.frame(splitseqres1)
+  pseudo.euk <- rbind(pseudo.euk, df)
+  }
+
+```
+
+Output those ASVs that were not chimeras.
+
+```{r}
+pseudo.combined <- rbind(pseudo, pseudo.euk)
+
+pseudo.combined.names <- as.character(unique(pseudo.combined$name))
+
+nonpseudo.combined <- rbind(nonpseudo, nonpseudo.euk)
+
+nonpseudo.combined.names <- as.character(unique(nonpseudo.combined$name))
+
+write.csv(nonpseudo.combined.names, "nonpseudo.combined.names.csv")
+```
+
+Load into phyloseq and subset to the non-pseudogenes only
+
+```{r}
+
+DEVOTES.otutab <- read.table("DEVOTES.merged.nochim_ASVs_counts.tsv", header = TRUE)
+DEVOTES.tax <- read.table("DEVOTES.merged.nochim_ASVs_taxonomy.tsv", header = TRUE)
+mapCOI<-read.csv("DEVOTES.metadata.csv", h=T, row.names=1)
+nonpseudo.combined.names<-read.csv("nonpseudo.combined.names.csv", h=T, row.names=1)
+
+
+DEVOTES.otutab.mat <- as.matrix(t(DEVOTES.otutab))
+DEVOTES.tax.mat <- as.matrix(DEVOTES.tax)
+
+DEVOTES.ps <- phyloseq(otu_table(DEVOTES.otutab.mat, taxa_are_rows=FALSE),
+                                  sample_data(mapCOI), 
+                                  tax_table(DEVOTES.tax.mat))
+
+nonpseudo.combined.names$x <- as.character(nonpseudo.combined.names$x)                                           
+
+DEVOTES.ps.nopseudo = prune_taxa(nonpseudo.combined.names$x, DEVOTES.ps)
+
+DEVOTES.ps.nopseudo = subset_taxa(DEVOTES.ps.nopseudo, Kingdom=="Eukaryota")
+
+
+org.ss <- as.data.frame(sample_sums(DEVOTES.ps))
+org.ss$Names <- rownames(org.ss)
+
+new.ss <- as.data.frame(sample_sums(DEVOTES.ps.nopseudo))
+new.ss$Names <- rownames(new.ss)
+
+control.rem.sums <- dplyr::left_join(org.ss, new.ss, by="Names")
+
+colnames(control.rem.sums) <- c("Original", "Names", "New")
+
+control.rem.sums.final <- control.rem.sums %>%
+  mutate(perc = New/Original*100)
+
+
+
+allTaxa = taxa_names(DEVOTES.ps)
+allTaxa <- allTaxa[!(allTaxa %in% nonpseudo.combined.names$x)]
+DEVOTES.pseudo = prune_taxa(allTaxa, DEVOTES.ps)
+
+```
+
